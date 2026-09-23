@@ -37,7 +37,7 @@
           </div>
         </div>
       </template>
-      
+
       <el-form :inline="true" :model="filterForm" class="filter-form mb-20">
         <el-form-item label="设备名称">
           <el-input v-model="filterForm.equipmentName" placeholder="请输入设备名称" clearable @input="handleFilter" />
@@ -106,6 +106,13 @@
             <el-button type="danger" size="small" link>删除</el-button>
           </template>
         </el-table-column>
+        <template #empty>
+          <div v-if="listError" class="table-state">
+            <el-alert :title="`设备列表加载失败：${listError}`" type="error" :closable="false" show-icon />
+            <el-button type="primary" size="small" style="margin-top: 12px;" @click="loadEquipmentList">重试</el-button>
+          </div>
+          <el-empty v-else description="暂无设备数据" />
+        </template>
       </el-table>
     </el-card>
 
@@ -126,11 +133,11 @@
               <el-badge :value="overdueCount" class="item" type="danger" />
             </div>
           </template>
-          <el-timeline>
-            <el-timeline-item 
-              v-for="(item, index) in maintenanceList" 
-              :key="index" 
-              :timestamp="item.date" 
+          <el-timeline v-if="maintenanceReminders.length">
+            <el-timeline-item
+              v-for="item in maintenanceReminders"
+              :key="item.id"
+              :timestamp="item.date"
               :type="item.type"
               @click="handleMaintenanceClick(item)"
               class="timeline-item"
@@ -142,6 +149,7 @@
               </div>
             </el-timeline-item>
           </el-timeline>
+          <el-empty v-else description="暂无待维护提醒" :image-size="80" />
         </el-card>
       </el-col>
     </el-row>
@@ -151,7 +159,17 @@
       title="维护登记"
       width="600px"
       :close-on-click-modal="false"
+      :before-close="handleMaintenanceDialogClose"
+      @closed="handleMaintenanceDialogClosed"
     >
+      <el-alert
+        v-if="submitError"
+        :title="submitError"
+        type="error"
+        show-icon
+        :closable="false"
+        class="mb-20"
+      />
       <el-form :model="maintenanceForm" :rules="maintenanceRules" ref="maintenanceFormRef" label-width="100px">
         <el-form-item label="设备名称" prop="equipmentName">
           <el-input v-model="maintenanceForm.equipmentName" disabled />
@@ -173,6 +191,7 @@
             type="date"
             placeholder="选择维护日期"
             value-format="YYYY-MM-DD"
+            :disabled-date="disableFutureDate"
           />
         </el-form-item>
         <el-form-item label="维护人员" prop="maintenancePerson">
@@ -214,7 +233,7 @@
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="maintenanceDialogVisible = false">取消</el-button>
+        <el-button @click="maintenanceDialogVisible = false" :disabled="submitLoading">取消</el-button>
         <el-button type="primary" @click="submitMaintenance" :loading="submitLoading">提交</el-button>
       </template>
     </el-dialog>
@@ -230,7 +249,7 @@
         <span class="label ml-20">设备编码：</span>
         <span class="value">{{ currentEquipment?.equipmentCode }}</span>
       </div>
-      <el-table :data="maintenanceRecords" border stripe style="width: 100%; margin-top: 15px;">
+      <el-table :data="maintenanceRecords" border stripe v-loading="recordsLoading" style="width: 100%; margin-top: 15px;">
         <el-table-column prop="maintenanceDate" label="维护日期" width="120" />
         <el-table-column prop="maintenanceType" label="维护类型" width="120">
           <template #default="{ row }">
@@ -250,6 +269,20 @@
           </template>
         </el-table-column>
         <el-table-column prop="remark" label="备注" min-width="150" show-overflow-tooltip />
+        <template #empty>
+          <div v-if="recordsError" class="table-state">
+            <el-alert :title="`维护记录加载失败：${recordsError}`" type="error" :closable="false" show-icon />
+            <el-button
+              type="primary"
+              size="small"
+              style="margin-top: 12px;"
+              @click="currentEquipment && loadMaintenanceRecords(currentEquipment.id)"
+            >
+              重试
+            </el-button>
+          </div>
+          <el-empty v-else description="该设备暂无维护记录" />
+        </template>
       </el-table>
       <template #footer>
         <el-button @click="recordDialogVisible = false">关闭</el-button>
@@ -259,19 +292,45 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, reactive } from 'vue'
+import { ref, computed, onMounted, reactive, watch } from 'vue'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import * as echarts from 'echarts'
-import type { MaintenanceRecord } from '@/api/equipment'
+import type { Equipment, MaintenanceRecord } from '@/api/equipment'
+import {
+  getMockEquipmentList,
+  saveMockEquipmentList,
+  getMockMaintenanceRecords,
+  addMockMaintenanceRecord
+} from '@/api/equipmentMock'
+
+/** 维护结果 -> 设备状态 的映射 */
+const RESULT_STATUS_MAP: Record<string, Equipment['status']> = {
+  '完成': '运行中',
+  '进行中': '待维护',
+  '待跟进': '故障'
+}
+
+interface MaintenanceReminder {
+  id: number
+  equipmentCode: string
+  equipmentName: string
+  date: string
+  content: string
+  type: 'primary' | 'warning' | 'danger'
+}
 
 const typeChart = ref<HTMLElement>()
 const loading = ref(false)
+const listError = ref('')
 const submitLoading = ref(false)
+const submitError = ref('')
+const recordsLoading = ref(false)
+const recordsError = ref('')
 const maintenanceDialogVisible = ref(false)
 const recordDialogVisible = ref(false)
 const maintenanceFormRef = ref<FormInstance>()
 
-const currentEquipment = ref<any>(null)
+const currentEquipment = ref<Equipment | null>(null)
 
 const filterForm = reactive({
   equipmentName: '',
@@ -280,8 +339,22 @@ const filterForm = reactive({
   dateRange: [] as string[]
 })
 
-const maintenanceForm = reactive({
-  equipmentId: null as number | null,
+interface MaintenanceFormState {
+  equipmentId: number | null
+  equipmentName: string
+  equipmentCode: string
+  maintenanceType: string
+  maintenanceDate: string
+  maintenancePerson: string
+  maintenanceContent: string
+  maintenanceResult: string
+  cost: number
+  nextMaintenanceDate: string
+  remark: string
+}
+
+const createDefaultForm = (): MaintenanceFormState => ({
+  equipmentId: null,
   equipmentName: '',
   equipmentCode: '',
   maintenanceType: '',
@@ -294,79 +367,145 @@ const maintenanceForm = reactive({
   remark: ''
 })
 
-const maintenanceRules: FormRules = {
-  maintenanceType: [{ required: true, message: '请选择维护类型', trigger: 'change' }],
-  maintenanceDate: [{ required: true, message: '请选择维护日期', trigger: 'change' }],
-  maintenancePerson: [{ required: true, message: '请输入维护人员', trigger: 'blur' }],
-  maintenanceContent: [{ required: true, message: '请输入维护内容', trigger: 'blur' }],
-  maintenanceResult: [{ required: true, message: '请选择维护结果', trigger: 'change' }]
+const maintenanceForm = reactive<MaintenanceFormState>(createDefaultForm())
+
+/** 本地日期工具：统一使用 YYYY-MM-DD 字符串，避免 toISOString 的时区偏移 */
+const pad2 = (n: number) => `${n}`.padStart(2, '0')
+const formatDate = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+const todayStr = () => formatDate(new Date())
+const addDays = (dateStr: string, days: number) => {
+  const d = new Date(`${dateStr}T00:00:00`)
+  d.setDate(d.getDate() + days)
+  return formatDate(d)
 }
 
-const equipmentStats = ref({
-  total: 156,
-  running: 128,
-  maintenance: 18,
-  fault: 10
+const validateMaintenanceDate = (_rule: any, value: string, callback: (e?: Error) => void) => {
+  if (!value) return callback()
+  if (value > todayStr()) {
+    return callback(new Error('维护日期不能晚于今天，请重新选择'))
+  }
+  if (maintenanceForm.nextMaintenanceDate && value >= maintenanceForm.nextMaintenanceDate) {
+    return callback(new Error('维护日期需早于下次维护日期'))
+  }
+  callback()
+}
+
+const validateNextMaintenanceDate = (_rule: any, value: string, callback: (e?: Error) => void) => {
+  if (!value) return callback()
+  if (maintenanceForm.maintenanceDate && value <= maintenanceForm.maintenanceDate) {
+    return callback(new Error('下次维护日期需晚于本次维护日期，请重新选择'))
+  }
+  callback()
+}
+
+const maintenanceRules: FormRules = {
+  maintenanceType: [{ required: true, message: '请选择维护类型', trigger: 'change' }],
+  maintenanceDate: [
+    { required: true, message: '请选择维护日期', trigger: 'change' },
+    { validator: validateMaintenanceDate, trigger: 'change' }
+  ],
+  maintenancePerson: [{ required: true, message: '请输入维护人员', trigger: 'blur' }],
+  maintenanceContent: [{ required: true, message: '请输入维护内容', trigger: 'blur' }],
+  maintenanceResult: [{ required: true, message: '请选择维护结果', trigger: 'change' }],
+  nextMaintenanceDate: [
+    { required: true, message: '请选择下次维护日期', trigger: 'change' },
+    { validator: validateNextMaintenanceDate, trigger: 'change' }
+  ]
+}
+
+const equipmentList = ref<Equipment[]>([])
+
+const maintenanceRecords = ref<MaintenanceRecord[]>([])
+
+/* ---------------- 统计卡片：唯一数据源为设备列表，禁止手工增减 ---------------- */
+const equipmentStats = computed(() => ({
+  total: equipmentList.value.length,
+  running: equipmentList.value.filter(e => e.status === '运行中').length,
+  maintenance: equipmentList.value.filter(e => e.status === '待维护').length,
+  fault: equipmentList.value.filter(e => e.status === '故障').length
+}))
+
+const isOverdue = (date: string) => !!date && date < todayStr()
+
+/* ---------------- 待维护提醒：同样从设备列表派生，保证与卡片、列表一致 ---------------- */
+const maintenanceReminders = computed<MaintenanceReminder[]>(() => {
+  const today = todayStr()
+  const soon = addDays(today, 7)
+  const items: MaintenanceReminder[] = []
+
+  for (const e of equipmentList.value) {
+    const next = e.nextMaintenanceDate
+    let type: MaintenanceReminder['type'] | null = null
+    let content = ''
+
+    if (e.status === '故障') {
+      type = 'danger'
+      content = '故障待维修'
+    } else if (next && next < today) {
+      type = 'danger'
+      content = '已逾期，请尽快安排维护'
+    } else if (e.status === '待维护') {
+      type = 'warning'
+      content = '到期需要进行常规维护'
+    } else if (next && next <= soon) {
+      type = 'primary'
+      content = '即将到期维护'
+    }
+
+    if (type) {
+      items.push({
+        id: e.id!,
+        equipmentCode: e.equipmentCode,
+        equipmentName: e.equipmentName,
+        date: next,
+        content,
+        type
+      })
+    }
+  }
+
+  // 逾期/故障排最前，其余按下次维护日期升序
+  return items.sort((a, b) => {
+    const aDanger = a.type === 'danger' ? 0 : 1
+    const bDanger = b.type === 'danger' ? 0 : 1
+    if (aDanger !== bDanger) return aDanger - bDanger
+    return (a.date || '').localeCompare(b.date || '')
+  })
 })
 
-const equipmentList = ref([
-  { id: 1, equipmentCode: 'PUMP-001', equipmentName: '抽油机A1', equipmentType: '抽油机', model: 'CYJ12-4.8-73HB', installLocation: 'A井场1号', wellName: 'A-01井', runningHours: 8520, status: '运行中', lastMaintenanceDate: '2024-01-10', nextMaintenanceDate: '2024-02-10' },
-  { id: 2, equipmentCode: 'PUMP-002', equipmentName: '抽油机B3', equipmentType: '抽油机', model: 'CYJ10-3-53HB', installLocation: 'B井场3号', wellName: 'B-03井', runningHours: 6350, status: '运行中', lastMaintenanceDate: '2024-01-05', nextMaintenanceDate: '2024-02-05' },
-  { id: 3, equipmentCode: 'VALVE-001', equipmentName: '阀门组C2', equipmentType: '阀门', model: 'Z41H-16C DN100', installLocation: 'C井场2号', wellName: 'C-02井', runningHours: 12500, status: '待维护', lastMaintenanceDate: '2023-12-20', nextMaintenanceDate: '2024-01-20' },
-  { id: 4, equipmentCode: 'SENSOR-001', equipmentName: '压力传感器D5', equipmentType: '传感器', model: 'PT-300', installLocation: 'D井场5号', wellName: 'D-05井', runningHours: 3200, status: '故障', lastMaintenanceDate: '2023-11-15', nextMaintenanceDate: '2023-12-15' },
-  { id: 5, equipmentCode: 'MOTOR-001', equipmentName: '电机E1', equipmentType: '电机', model: 'Y2-315M-4', installLocation: 'E井场1号', wellName: 'E-01井', runningHours: 9800, status: '运行中', lastMaintenanceDate: '2024-01-08', nextMaintenanceDate: '2024-02-08' },
-  { id: 6, equipmentCode: 'PUMP-003', equipmentName: '抽油机C1', equipmentType: '抽油机', model: 'CYJ12-4.8-73HB', installLocation: 'C井场1号', wellName: 'C-01井', runningHours: 7200, status: '待维护', lastMaintenanceDate: '2023-11-25', nextMaintenanceDate: '2023-12-25' },
-  { id: 7, equipmentCode: 'VALVE-002', equipmentName: '阀门组A3', equipmentType: '阀门', model: 'Z41H-16C DN80', installLocation: 'A井场3号', wellName: 'A-03井', runningHours: 9500, status: '运行中', lastMaintenanceDate: '2024-01-12', nextMaintenanceDate: '2024-02-12' }
-])
-
-const maintenanceList = ref([
-  { id: 3, date: '2024-01-20', equipmentName: '阀门组C2', equipmentCode: 'VALVE-001', content: '到期需要进行常规维护', type: 'warning' },
-  { id: 4, date: '2024-01-25', equipmentName: '压力传感器D5', equipmentCode: 'SENSOR-001', content: '故障待维修', type: 'danger' },
-  { id: 6, date: '2023-12-25', equipmentName: '抽油机C1', equipmentCode: 'PUMP-003', content: '已逾期，请尽快安排维护', type: 'danger' },
-  { id: 2, date: '2024-02-05', equipmentName: '抽油机B3', equipmentCode: 'PUMP-002', content: '即将到期维护', type: 'primary' },
-  { id: 5, date: '2024-02-08', equipmentName: '电机E1', equipmentCode: 'MOTOR-001', content: '即将到期维护', type: 'primary' },
-  { id: 1, date: '2024-02-10', equipmentName: '抽油机A1', equipmentCode: 'PUMP-001', content: '即将到期维护', type: 'primary' }
-])
-
-const maintenanceRecords = ref<MaintenanceRecord[]>([
-  { id: 1, equipmentId: 1, equipmentName: '抽油机A1', equipmentCode: 'PUMP-001', maintenanceType: '常规维护', maintenanceDate: '2024-01-10', maintenancePerson: '张三', maintenanceContent: '检查润滑油、紧固螺丝、清洁设备表面', maintenanceResult: '完成', cost: 500, remark: '运行正常' },
-  { id: 2, equipmentId: 1, equipmentName: '抽油机A1', equipmentCode: 'PUMP-001', maintenanceType: '定期保养', maintenanceDate: '2023-10-15', maintenancePerson: '李四', maintenanceContent: '更换油封、检查皮带张力', maintenanceResult: '完成', cost: 1200, remark: '皮带磨损正常' },
-  { id: 3, equipmentId: 3, equipmentName: '阀门组C2', equipmentCode: 'VALVE-001', maintenanceType: '常规维护', maintenanceDate: '2023-12-20', maintenancePerson: '王五', maintenanceContent: '阀门开关测试、密封检查', maintenanceResult: '完成', cost: 200, remark: '一切正常' }
-])
-
-const overdueCount = computed(() => {
-  return maintenanceList.value.filter(item => item.type === 'danger').length
-})
+/** 逾期提醒角标：与时间线中的 danger 条目严格一致 */
+const overdueCount = computed(() =>
+  maintenanceReminders.value.filter(item => item.type === 'danger').length
+)
 
 const filteredEquipmentList = computed(() => {
   let result = [...equipmentList.value]
-  
+
   if (filterForm.equipmentName) {
-    result = result.filter(item => 
+    result = result.filter(item =>
       item.equipmentName.includes(filterForm.equipmentName)
     )
   }
-  
+
   if (filterForm.equipmentType) {
-    result = result.filter(item => 
+    result = result.filter(item =>
       item.equipmentType === filterForm.equipmentType
     )
   }
-  
+
   if (filterForm.status) {
-    result = result.filter(item => 
+    result = result.filter(item =>
       item.status === filterForm.status
     )
   }
-  
+
   if (filterForm.dateRange && filterForm.dateRange.length === 2) {
     const [start, end] = filterForm.dateRange
-    result = result.filter(item => {
-      const nextDate = new Date(item.nextMaintenanceDate)
-      return nextDate >= new Date(start) && nextDate <= new Date(end)
-    })
+    result = result.filter(item =>
+      item.nextMaintenanceDate >= start && item.nextMaintenanceDate <= end
+    )
   }
-  
+
   return result
 })
 
@@ -399,12 +538,11 @@ const getResultColor = (result: string) => {
   return map[result] || 'info'
 }
 
-const isOverdue = (date: string) => {
-  return new Date(date) < new Date()
-}
+const disableFutureDate = (d: Date) =>
+  d.getTime() > new Date(`${todayStr()}T23:59:59`).getTime()
 
 const handleFilter = () => {
-  console.log('Filter applied:', filterForm)
+  // 筛选由 computed 自动完成
 }
 
 const resetFilter = () => {
@@ -416,87 +554,168 @@ const resetFilter = () => {
 
 const filterByStatus = (status: string) => {
   filterForm.status = status
-  handleFilter()
 }
 
-const openMaintenanceDialog = (row: any) => {
-  const today = new Date().toISOString().split('T')[0]
-  const nextMonth = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
-  
-  maintenanceForm.equipmentId = row.id
-  maintenanceForm.equipmentName = row.equipmentName
-  maintenanceForm.equipmentCode = row.equipmentCode || row.equipmentCode
-  maintenanceForm.maintenanceType = ''
-  maintenanceForm.maintenanceDate = today
-  maintenanceForm.maintenancePerson = ''
-  maintenanceForm.maintenanceContent = ''
-  maintenanceForm.maintenanceResult = ''
-  maintenanceForm.cost = 0
-  maintenanceForm.nextMaintenanceDate = nextMonth
-  maintenanceForm.remark = ''
-  
+/* ---------------- 维护登记草稿：中断/取消后再次进入不丢失费用与备注 ---------------- */
+const draftKey = (equipmentId: number | null) =>
+  `equipment-maintenance-draft-${equipmentId}`
+
+watch(maintenanceForm, (val) => {
+  // 仅在登记弹窗打开、且已绑定设备时持久化；
+  // 弹窗关闭后的残留赋值不写回，恢复草稿时回写的是同一份数据，幂等无副作用
+  if (!maintenanceDialogVisible.value || val.equipmentId == null) return
+  localStorage.setItem(draftKey(val.equipmentId), JSON.stringify(val))
+}, { deep: true })
+
+const openMaintenanceDialog = (row: Partial<Equipment> & { id?: number }) => {
+  const equipment = equipmentList.value.find(e => e.id === row.id)
+  const target = equipment || (row as Equipment)
+
+  submitError.value = ''
+  // 先重置为默认值，防止上一台设备的数据串入
+  Object.assign(maintenanceForm, createDefaultForm(), {
+    equipmentId: target.id ?? null,
+    equipmentName: target.equipmentName ?? '',
+    equipmentCode: target.equipmentCode ?? '',
+    maintenanceDate: todayStr(),
+    nextMaintenanceDate: addDays(todayStr(), 30)
+  })
+
+  // 恢复该设备上次未提交成功的草稿（含费用、备注等全部字段）
+  let restored = false
+  if (target.id != null) {
+    try {
+      const raw = localStorage.getItem(draftKey(target.id))
+      if (raw) {
+        const draft = JSON.parse(raw)
+        if (draft && draft.equipmentId === target.id) {
+          Object.assign(maintenanceForm, draft)
+          restored = true
+        }
+      }
+    } catch {
+      // 草稿损坏时忽略，使用默认表单
+    }
+  }
+
   maintenanceDialogVisible.value = true
+  maintenanceFormRef.value?.clearValidate()
+  if (restored) ElMessage.info('已恢复上次未提交的维护登记内容，请确认后重新提交')
+}
+
+const handleMaintenanceDialogClose = (done: () => void) => {
+  // 提交进行中禁止误关闭导致中断
+  if (submitLoading.value) return
+  done()
+}
+
+const handleMaintenanceDialogClosed = () => {
+  // 草稿已在 watch 中保存；关闭后仅清理校验态，不清除草稿，便于再次进入恢复
+  submitError.value = ''
+  maintenanceFormRef.value?.clearValidate()
 }
 
 const submitMaintenance = async () => {
-  if (!maintenanceFormRef.value) return
-  
-  await maintenanceFormRef.value.validate((valid) => {
-    if (valid) {
-      submitLoading.value = true
-      
-      setTimeout(() => {
-        const newRecord: MaintenanceRecord = {
-          id: Date.now(),
-          equipmentId: maintenanceForm.equipmentId!,
-          equipmentName: maintenanceForm.equipmentName,
-          equipmentCode: maintenanceForm.equipmentCode,
-          maintenanceType: maintenanceForm.maintenanceType,
-          maintenanceDate: maintenanceForm.maintenanceDate,
-          maintenancePerson: maintenanceForm.maintenancePerson,
-          maintenanceContent: maintenanceForm.maintenanceContent,
-          maintenanceResult: maintenanceForm.maintenanceResult,
-          cost: maintenanceForm.cost,
-          remark: maintenanceForm.remark,
-          createdAt: new Date().toISOString()
-        }
-        
-        maintenanceRecords.value.unshift(newRecord)
-        
-        const equipment = equipmentList.value.find(e => e.id === maintenanceForm.equipmentId)
-        if (equipment) {
-          equipment.lastMaintenanceDate = maintenanceForm.maintenanceDate
-          equipment.nextMaintenanceDate = maintenanceForm.nextMaintenanceDate
-          if (maintenanceForm.maintenanceResult === '完成') {
-            equipment.status = '运行中'
-          }
-        }
-        
-        const reminderIndex = maintenanceList.value.findIndex(m => m.id === maintenanceForm.equipmentId)
-        if (reminderIndex > -1) {
-          maintenanceList.value.splice(reminderIndex, 1)
-        }
-        
-        if (equipment) {
-          equipmentStats.value.maintenance--
-          equipmentStats.value.running++
-        }
-        
-        ElMessage.success('维护登记成功！')
-        maintenanceDialogVisible.value = false
-        submitLoading.value = false
-      }, 500)
+  if (!maintenanceFormRef.value || maintenanceForm.equipmentId == null) return
+
+  try {
+    await maintenanceFormRef.value.validate()
+  } catch {
+    // 校验未通过（含日期超出范围）：保留全部输入，用户修改后可直接重试
+    return
+  }
+
+  submitLoading.value = true
+  submitError.value = ''
+
+  const payload: MaintenanceRecord = {
+    equipmentId: maintenanceForm.equipmentId,
+    equipmentName: maintenanceForm.equipmentName,
+    equipmentCode: maintenanceForm.equipmentCode,
+    maintenanceType: maintenanceForm.maintenanceType,
+    maintenanceDate: maintenanceForm.maintenanceDate,
+    maintenancePerson: maintenanceForm.maintenancePerson,
+    maintenanceContent: maintenanceForm.maintenanceContent,
+    maintenanceResult: maintenanceForm.maintenanceResult,
+    cost: maintenanceForm.cost,
+    remark: maintenanceForm.remark
+  }
+
+  try {
+    const savedRecord = await addMockMaintenanceRecord(payload)
+
+    // 记录接口成功后，再更新设备状态——只有状态真正发生变化时才改写，
+    // 统计卡片与提醒由 computed 自动重算，无需（也不允许）手工加减
+    const equipment = equipmentList.value.find(e => e.id === payload.equipmentId)
+    if (equipment) {
+      const nextStatus = RESULT_STATUS_MAP[payload.maintenanceResult]
+      const statusChanged = !!nextStatus && equipment.status !== nextStatus
+      if (statusChanged) {
+        equipment.status = nextStatus
+      }
+      // 仅“完成”的维护才滚动维护日期，未完成的登记不改变排期
+      if (payload.maintenanceResult === '完成') {
+        equipment.lastMaintenanceDate = payload.maintenanceDate
+        equipment.nextMaintenanceDate = maintenanceForm.nextMaintenanceDate
+      }
+      await saveMockEquipmentList(equipmentList.value)
     }
-  })
+
+    // 同步本地已加载的记录（记录弹窗若正打开同一设备可立即看到）
+    maintenanceRecords.value = [
+      savedRecord,
+      ...maintenanceRecords.value.filter(r => r.id !== savedRecord.id)
+    ]
+
+    localStorage.removeItem(draftKey(payload.equipmentId))
+    ElMessage.success('维护登记成功！')
+    maintenanceDialogVisible.value = false
+  } catch (e: any) {
+    // 提交失败 / 响应异常：说明原因，表单与草稿原样保留，允许重试
+    const reason = e?.message || '响应异常，请稍后重试'
+    submitError.value = `维护登记提交失败：${reason}。已保留您填写的内容（含费用与备注），可直接修改后重试。`
+    ElMessage.error(submitError.value)
+  } finally {
+    submitLoading.value = false
+  }
 }
 
-const viewMaintenanceRecords = (row: any) => {
+/* ---------------- 维护记录弹窗：加载 / 空态 / 失败重试 ---------------- */
+const loadEquipmentList = async () => {
+  loading.value = true
+  listError.value = ''
+  try {
+    equipmentList.value = await getMockEquipmentList()
+  } catch (e: any) {
+    listError.value = e?.message || '响应异常'
+  } finally {
+    loading.value = false
+  }
+}
+
+const loadMaintenanceRecords = async (equipmentId: number) => {
+  recordsLoading.value = true
+  recordsError.value = ''
+  maintenanceRecords.value = []
+  try {
+    maintenanceRecords.value = await getMockMaintenanceRecords(equipmentId)
+  } catch (e: any) {
+    recordsError.value = e?.message || '响应异常，请稍后重试'
+  } finally {
+    recordsLoading.value = false
+  }
+}
+
+const viewMaintenanceRecords = async (row: Equipment) => {
   currentEquipment.value = row
   recordDialogVisible.value = true
+  await loadMaintenanceRecords(row.id!)
+  // 关闭弹窗返回列表后，统计卡片与提醒均来自 equipmentList 的 computed，
+  // 维护登记引发的变化会自动同步显示，无需额外刷新
 }
 
-const handleMaintenanceClick = (item: any) => {
-  console.log('Clicked reminder:', item)
+const handleMaintenanceClick = (item: MaintenanceReminder) => {
+  openMaintenanceDialog(item)
 }
 
 const initChart = () => {
@@ -528,6 +747,7 @@ const initChart = () => {
 }
 
 onMounted(() => {
+  loadEquipmentList()
   initChart()
 })
 </script>
@@ -545,37 +765,37 @@ onMounted(() => {
   box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.08);
   cursor: pointer;
   transition: all 0.3s;
-  
+
   &:hover {
     transform: translateY(-2px);
     box-shadow: 0 4px 16px 0 rgba(0, 0, 0, 0.12);
   }
-  
+
   &.running {
     .stat-value {
       color: #22c55e;
     }
   }
-  
+
   &.maintenance {
     .stat-value {
       color: #f59e0b;
     }
   }
-  
+
   &.fault {
     .stat-value {
       color: #ef4444;
     }
   }
-  
+
   .stat-value {
     font-size: 36px;
     font-weight: 600;
     color: #1e293b;
     margin-bottom: 8px;
   }
-  
+
   .stat-label {
     font-size: 14px;
     color: #64748b;
@@ -594,7 +814,7 @@ onMounted(() => {
   background: #f8fafc;
   border-radius: 8px;
   margin-bottom: 0;
-  
+
   :deep(.el-form-item) {
     margin-bottom: 0;
   }
@@ -603,6 +823,16 @@ onMounted(() => {
 .chart-medium {
   width: 100%;
   height: 300px;
+}
+
+.table-state {
+  padding: 24px 0;
+  text-align: center;
+
+  .el-alert {
+    max-width: 420px;
+    margin: 0 auto;
+  }
 }
 
 .text-danger {
@@ -627,7 +857,7 @@ onMounted(() => {
 
 .timeline-item {
   cursor: pointer;
-  
+
   &:hover {
     .timeline-content {
       background: #f8fafc;
@@ -642,12 +872,12 @@ onMounted(() => {
   padding: 5px 0;
   border-radius: 4px;
   transition: background 0.3s;
-  
+
   .equipment-name {
     font-weight: 600;
     margin-right: 10px;
   }
-  
+
   .content {
     color: #64748b;
     margin-right: 10px;
@@ -658,11 +888,11 @@ onMounted(() => {
   padding: 10px;
   background: #f8fafc;
   border-radius: 8px;
-  
+
   .label {
     color: #64748b;
   }
-  
+
   .value {
     font-weight: 600;
     color: #1e293b;
