@@ -27,6 +27,7 @@ export interface MaintenanceRecord {
   maintenanceResult: string
   cost?: number
   remark?: string
+  nextMaintenanceDate?: string
   createdAt?: string
 }
 
